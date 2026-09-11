@@ -109,11 +109,12 @@ bool is_vma_range_fmt(char *line)
 	return __is_vma_range_fmt(line);
 }
 
-static int handle_vma_plugin(int *fd, struct stat *stat)
+static int handle_vma_plugin(int *fd, struct stat *stat, uint64_t pgoff,
+			     uint64_t length)
 {
 	int ret;
 
-	ret = run_plugins(HANDLE_DEVICE_VMA, *fd, stat);
+	ret = run_plugins(HANDLE_DEVICE_VMA, *fd, stat, pgoff, length);
 	if (ret < 0) {
 		pr_perror("handle_device_vma plugin failed");
 		return ret;
@@ -665,7 +666,9 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 			/* devzero mapping -- also makes sense */;
 			pr_debug("Found devzero mapping, OK\n");
 		} else {
-			int plugin_ret = handle_vma_plugin(vm_file_fd, st_buf);
+			int plugin_ret = handle_vma_plugin(vm_file_fd, st_buf,
+						   vma_area->e->pgoff,
+						   vma_area_len(vma_area));
 
 			if (plugin_ret < 0) {
 				/* non-regular mapping with no supporting plugin */

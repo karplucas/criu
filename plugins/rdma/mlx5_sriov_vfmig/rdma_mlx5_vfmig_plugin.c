@@ -323,7 +323,10 @@ static int rdma_mlx5_vfmig_plugin_claim_uverbs_context(const char *ibdev, uint32
  * everything else with -ENOTSUP so the mapping falls through to any
  * other plugin or to the core's default handling.
  */
-static int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd, const struct stat *st)
+static int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd,
+						    const struct stat *st,
+						    uint64_t pgoff,
+						    uint64_t length)
 {
 	struct mlx5_vfmig_query_vf q;
 	char ibdev[64], vf_bdf[64], pf_bdf[64];
@@ -332,6 +335,8 @@ static int rdma_mlx5_vfmig_plugin_handle_device_vma(int fd, const struct stat *s
 	int vf_id, cdev_fd, rc;
 
 	(void)fd;
+	(void)pgoff;
+	(void)length;
 
 	if (!vfmig_active)
 		return -ENOTSUP;

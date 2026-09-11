@@ -459,10 +459,14 @@ static int amdgpu_add_to_inventory(void)
 	return ret;
 }
 
-int amdgpu_plugin_handle_device_vma(int fd, const struct stat *st_buf)
+int amdgpu_plugin_handle_device_vma(int fd, const struct stat *st_buf,
+				    uint64_t pgoff, uint64_t length)
 {
 	struct stat st_kfd;
 	int ret = 0;
+
+	(void)pgoff;
+	(void)length;
 
 	/*
 	 * /dev/kfd absent => no AMD GPU on this host => this VMA is

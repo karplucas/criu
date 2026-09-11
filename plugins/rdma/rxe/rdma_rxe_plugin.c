@@ -126,6 +126,74 @@ struct rxe_frozen_context {
 };
 static struct rxe_frozen_context *rxe_frozen_contexts;
 
+enum rxe_queue_role {
+	RXE_QUEUE_CQ,
+	RXE_QUEUE_SQ,
+	RXE_QUEUE_RQ,
+};
+
+struct rxe_queue_mapping {
+	char ibdev[64];
+	uint64_t pgoff;
+	uint64_t length;
+	uint32_t ufile_id;
+	enum rxe_queue_role role;
+	struct rxe_queue_mapping *next;
+};
+static struct rxe_queue_mapping *rxe_queue_mappings;
+
+static int rxe_queue_mapping_add(const char *ibdev, uint64_t pgoff,
+				 uint64_t length, uint32_t ufile_id,
+				 enum rxe_queue_role role)
+{
+	struct rxe_queue_mapping *mapping;
+
+	if (!pgoff || !length || pgoff + length < pgoff)
+		return -EINVAL;
+	mapping = calloc(1, sizeof(*mapping));
+	if (!mapping)
+		return -ENOMEM;
+	snprintf(mapping->ibdev, sizeof(mapping->ibdev), "%s", ibdev);
+	mapping->pgoff = pgoff;
+	mapping->length = length;
+	mapping->ufile_id = ufile_id;
+	mapping->role = role;
+	mapping->next = rxe_queue_mappings;
+	rxe_queue_mappings = mapping;
+	return 0;
+}
+
+static struct rxe_queue_mapping *rxe_queue_mapping_find(const char *ibdev,
+							 uint64_t pgoff,
+							 uint64_t length)
+{
+	struct rxe_queue_mapping *mapping;
+
+	for (mapping = rxe_queue_mappings; mapping; mapping = mapping->next) {
+		if (strcmp(mapping->ibdev, ibdev))
+			continue;
+		if (pgoff < mapping->pgoff)
+			continue;
+		if (pgoff - mapping->pgoff > mapping->length)
+			continue;
+		if (length > mapping->length - (pgoff - mapping->pgoff))
+			continue;
+		return mapping;
+	}
+	return NULL;
+}
+
+static void rxe_queue_mappings_drop_all(void)
+{
+	struct rxe_queue_mapping *mapping, *next;
+
+	for (mapping = rxe_queue_mappings; mapping; mapping = next) {
+		next = mapping->next;
+		free(mapping);
+	}
+	rxe_queue_mappings = NULL;
+}
+
 static int rxe_load_image_on_restore(void);
 static int rxe_create_save_fd(int control_fd);
 static int rxe_save_registered_contexts(void);
@@ -153,12 +221,14 @@ static int rxe_save_registered_contexts(void);
 #define RXE_CACHED_FD_FLOOR 1024
 struct rxe_cdev_cache_entry {
 	char ibdev[64];
+	uint32_t ufile_id;
 	int fd; /* high-numbered dup of the GET_CONTEXT'd cdev fd */
 	struct rxe_cdev_cache_entry *next;
 };
 static struct rxe_cdev_cache_entry *rxe_cdev_cache;
 
-static void rxe_cdev_cache_remember(const char *ibdev, int fd)
+static void rxe_cdev_cache_remember(const char *ibdev, uint32_t ufile_id,
+				    int fd)
 {
 	struct rxe_cdev_cache_entry *e;
 
@@ -171,18 +241,19 @@ static void rxe_cdev_cache_remember(const char *ibdev, int fd)
 		return;
 	}
 	snprintf(e->ibdev, sizeof(e->ibdev), "%s", ibdev);
+	e->ufile_id = ufile_id;
 	e->fd = fd;
 	e->next = rxe_cdev_cache;
 	rxe_cdev_cache = e;
 	pr_debug("rxe_cdev_cache: remembered ibdev=%s fd=%d\n", ibdev, fd);
 }
 
-static int rxe_cdev_cache_lookup(const char *ibdev)
+static int rxe_cdev_cache_lookup(const char *ibdev, uint32_t ufile_id)
 {
 	struct rxe_cdev_cache_entry *e;
 
 	for (e = rxe_cdev_cache; e; e = e->next)
-		if (!strcmp(e->ibdev, ibdev))
+		if (!strcmp(e->ibdev, ibdev) && e->ufile_id == ufile_id)
 			return e->fd;
 	return -1;
 }
@@ -363,6 +434,7 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 	 */
 	if (stage == CR_PLUGIN_STAGE__RESTORE)
 		rxe_cdev_cache_drop_all();
+	rxe_queue_mappings_drop_all();
 }
 
 static int rdma_rxe_plugin_dump_devices_late(int pid)
@@ -778,7 +850,7 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 			close(fd);
 			return -1;
 		}
-		rxe_cdev_cache_remember(uvfe->ib_dev, hi);
+		rxe_cdev_cache_remember(uvfe->ib_dev, uvfe->id, hi);
 	}
 
 	return fd;
@@ -870,8 +942,11 @@ static int rxe_match_cdev_vma(const struct stat *st, char *ibdev_out,
  *
  * @fd is unused: we resolve off @st->st_rdev only.
  */
-static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
+static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st,
+					     uint64_t pgoff,
+					     uint64_t length)
 {
+	struct rxe_queue_mapping *mapping;
 	char ibdev[64];
 	int rc;
 
@@ -880,10 +955,13 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
 	rc = rxe_match_cdev_vma(st, ibdev, sizeof(ibdev));
 	if (rc)
 		return rc;
+	mapping = rxe_queue_mapping_find(ibdev, pgoff, length);
+	if (!mapping)
+		return -ENOTSUP;
 
-	pr_info("handle_vma(%s): claiming uverbs-cdev mapping "
-		"(rxe per-uobject queue: CQ ring / QP rings / SRQ)\n",
-		ibdev);
+	pr_info("handle_vma(%s): queue role=%u offset=%#" PRIx64
+		" length=%#" PRIx64 "\n", ibdev, mapping->role, pgoff,
+		length);
 	return CR_PLUGIN_VMA_CONTENT;
 }
 
@@ -937,8 +1015,9 @@ struct rxe_query_cq_resp_local {
 	uint32_t cqe;
 	uint32_t producer;
 	uint32_t consumer;
-	uint32_t cqe_image_bytes;
-	uint32_t reserved[2];
+	uint32_t queue_size;
+	uint32_t notify;
+	uint32_t reserved;
 };
 
 /*
@@ -960,13 +1039,19 @@ struct rxe_query_cq_resp_local {
  */
 struct rxe_cq_plugin_blob {
 	uint64_t vm_pgoff;
+	uint64_t queue_size;
+};
+_Static_assert(sizeof(struct rxe_cq_plugin_blob) == 16,
+	       "rxe_cq_plugin_blob must be 16 bytes");
+
+struct rxe_restore_cq_req_local {
+	uint64_t vm_pgoff;
 	uint32_t producer;
 	uint32_t consumer;
 	uint32_t cqe_image_bytes;
+	uint32_t notify;
 	uint32_t reserved;
 };
-_Static_assert(sizeof(struct rxe_cq_plugin_blob) == 24,
-	       "rxe_cq_plugin_blob must be 24 bytes (field-identical to kernel rxe_restore_cq_req)");
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::mminfo
@@ -1077,25 +1162,16 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_drive
 {
 	struct rxe_query_cq_resp_local resp = {};
 	struct rxe_cq_plugin_blob *pb;
-	uint8_t *cqe_img = NULL;
-	uint8_t *buf;
-	size_t total;
 	int rc;
 
 	(void)kernel_driver_id;
 	(void)pid;
 
-	cqe_img = malloc(RXE_CQ_IMAGE_CAP_LOCAL);
-	if (!cqe_img) {
-		pr_err("rxe: dump_uobj_cq: out of memory for CQE image buffer (handle=%u)\n", ufile_handle);
-		return -ENOMEM;
-	}
-
-	rc = rxe_query_cq(lfd, ufile_handle, &resp, cqe_img, RXE_CQ_IMAGE_CAP_LOCAL);
+	rc = rxe_query_cq(lfd, ufile_handle, &resp, NULL, 0);
 	if (rc) {
 		pr_err("rxe: dump_uobj_cq: QUERY_CQ(handle=%u) on ibdev=%s failed: %d (%s)\n", ufile_handle, ibdev, rc,
 		       strerror(-rc));
-		goto out;
+		return rc;
 	}
 
 	/*
@@ -1109,57 +1185,32 @@ static int rdma_rxe_plugin_dump_uobj_cq(const char *ibdev, uint32_t kernel_drive
 		       "structural inconsistency, aborting dump\n",
 		       ufile_handle, ibdev, cq_attrs->cqe_count, resp.cqe);
 		rc = -EILSEQ;
-		goto out;
+		return rc;
 	}
-
-	/*
-	 * The image ships as a single uverbs attr whose len is u16, so the
-	 * header + in-flight subspan must fit in RXE_CQ_IMAGE_CAP_LOCAL.
-	 * The kernel already fails QUERY_CQ with -ENOSPC if the subspan
-	 * exceeds the advertised cap; guard here too (defence in depth,
-	 * and to reject a report inconsistent with the buffer we passed).
-	 */
-	if (resp.cqe_image_bytes > RXE_CQ_IMAGE_CAP_LOCAL) {
-		pr_err("rxe: CQ handle=%u on ibdev=%s: in-flight CQE image (%u bytes) exceeds the %u-byte cap; "
-		       "deep-ring chunking is a kernel-side follow-up\n",
-		       ufile_handle, ibdev, resp.cqe_image_bytes, RXE_CQ_IMAGE_CAP_LOCAL);
-		rc = -E2BIG;
-		goto out;
-	}
-
-	total = sizeof(*pb) + resp.cqe_image_bytes;
-	buf = malloc(total);
-	if (!buf) {
-		pr_err("rxe: dump_uobj_cq: out of memory packing plugin_blob (handle=%u, %zu bytes)\n", ufile_handle,
-		       total);
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	pb = (struct rxe_cq_plugin_blob *)buf;
+	pb = calloc(1, sizeof(*pb));
+	if (!pb)
+		return -ENOMEM;
 	pb->vm_pgoff = resp.vm_pgoff;
-	pb->producer = resp.producer;
-	pb->consumer = resp.consumer;
-	pb->cqe_image_bytes = resp.cqe_image_bytes;
-	pb->reserved = 0;
-	if (resp.cqe_image_bytes)
-		memcpy(buf + sizeof(*pb), cqe_img, resp.cqe_image_bytes);
-
-	plugin_blob->data = buf;
-	plugin_blob->len = total;
+	pb->queue_size = resp.queue_size;
+	plugin_blob->data = (uint8_t *)pb;
+	plugin_blob->len = sizeof(*pb);
+	rc = rxe_queue_mapping_add(ibdev, resp.vm_pgoff, resp.queue_size, 0,
+				   RXE_QUEUE_CQ);
+	if (rc) {
+		free(pb);
+		plugin_blob->data = NULL;
+		plugin_blob->len = 0;
+		return rc;
+	}
 
 	cq_attrs->has_comp_vector = true;
 	cq_attrs->comp_vector = 0;
 	cq_attrs->has_flags = true;
 	cq_attrs->flags = 0;
 
-	pr_info("rxe: dump_uobj_cq: ibdev=%s handle=%u cqe=%u vm_pgoff=%#" PRIx64 " q(prod=%u cons=%u) image_bytes=%u\n",
-		ibdev, ufile_handle, resp.cqe, (uint64_t)resp.vm_pgoff, resp.producer, resp.consumer,
-		resp.cqe_image_bytes);
-	rc = 0;
-out:
-	free(cqe_img);
-	return rc;
+	pr_info("rxe: CQ handle=%u offset=%#" PRIx64 " size=%u\n",
+		ufile_handle, resp.vm_pgoff, resp.queue_size);
+	return 0;
 }
 
 /*
@@ -1248,13 +1299,20 @@ struct rxe_restore_qp_req_local {
 	uint32_t resp_status;
 	uint32_t res_head;
 	uint32_t res_tail;
-	uint32_t sq_image_bytes;
-	uint32_t rq_image_bytes;
+	uint32_t sq_queue_size;
+	uint32_t rq_queue_size;
 	uint32_t res_image_bytes;
 	uint64_t reserved2 __attribute__((aligned(8)));
 };
 _Static_assert(sizeof(struct rxe_restore_qp_req_local) == 232,
 	       "rxe_restore_qp_req_local must be 232 bytes (field-identical to kernel rxe_restore_qp_req)");
+
+struct rxe_qp_plugin_blob {
+	uint64_t sq_vm_pgoff;
+	uint64_t rq_vm_pgoff;
+	uint64_t sq_queue_size;
+	uint64_t rq_queue_size;
+};
 
 /*
  * Byte-equal mirror of include/uapi/rdma/rdma_user_rxe.h::
@@ -1357,6 +1415,7 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
 					pid_t pid, RdmaQpAttrs *qp_attrs, ProtobufCBinaryData *plugin_blob)
 {
 	struct rxe_restore_qp_req_local req = {};
+	struct rxe_qp_plugin_blob *pb;
 	uint64_t user_handle = 0;
 	int rc;
 
@@ -1369,8 +1428,26 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
 		       strerror(-rc));
 		return rc;
 	}
-	plugin_blob->data = NULL;
-	plugin_blob->len = 0;
+	pb = calloc(1, sizeof(*pb));
+	if (!pb)
+		return -ENOMEM;
+	pb->sq_vm_pgoff = req.sq_vm_pgoff;
+	pb->rq_vm_pgoff = req.rq_vm_pgoff;
+	pb->sq_queue_size = req.sq_queue_size;
+	pb->rq_queue_size = req.rq_queue_size;
+	plugin_blob->data = (uint8_t *)pb;
+	plugin_blob->len = sizeof(*pb);
+	rc = rxe_queue_mapping_add(ibdev, req.sq_vm_pgoff,
+				   req.sq_queue_size, 0, RXE_QUEUE_SQ);
+	if (!rc && req.rq_vm_pgoff)
+		rc = rxe_queue_mapping_add(ibdev, req.rq_vm_pgoff,
+					   req.rq_queue_size, 0, RXE_QUEUE_RQ);
+	if (rc) {
+		free(pb);
+		plugin_blob->data = NULL;
+		plugin_blob->len = 0;
+		return rc;
+	}
 
 	qp_attrs->has_user_handle = true;
 	qp_attrs->user_handle = user_handle;
@@ -1404,10 +1481,9 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
 static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
 {
 	const struct rxe_cq_plugin_blob *pb;
+	struct rxe_restore_cq_req_local *in;
 	struct rxe_create_cq_resp_local *out;
 	uint64_t vm_pgoff;
-	size_t want;
-	void *inbuf;
 
 	if (!e || !uhw)
 		return -EINVAL;
@@ -1419,15 +1495,15 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
 		return -EINVAL;
 	}
 	pb = (const struct rxe_cq_plugin_blob *)e->plugin_blob.data;
-	want = sizeof(*pb) + (size_t)pb->cqe_image_bytes;
-	if (e->plugin_blob.len != want) {
-		pr_err("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu (%zuB header + "
-		       "cqe_img=%u tail)\n",
-		       e->has_ufile_handle ? e->ufile_handle : 0, e->plugin_blob.len, want, sizeof(*pb),
-		       pb->cqe_image_bytes);
+	if (e->plugin_blob.len != sizeof(*pb)) {
+		pr_err("rxe: CQ queue metadata has invalid length %zu\n",
+		       e->plugin_blob.len);
 		return -EINVAL;
 	}
 	vm_pgoff = pb->vm_pgoff;
+	if (rxe_queue_mapping_add(rxe_ibdev_name, vm_pgoff, pb->queue_size,
+				  e->ufile_id, RXE_QUEUE_CQ))
+		return -EINVAL;
 
 	out = malloc(sizeof(*out));
 	if (!out) {
@@ -1440,21 +1516,21 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
 	uhw->out_len = sizeof(*out);
 	uhw->verify_len = vm_pgoff ? sizeof(out->mi_offset) : 0;
 
-	inbuf = malloc(e->plugin_blob.len);
-	if (!inbuf) {
+	in = calloc(1, sizeof(*in));
+	if (!in) {
 		free(out);
 		uhw->out_buf = NULL;
 		uhw->out_len = 0;
 		uhw->verify_len = 0;
-		pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
+		pr_err("rxe: RESTORE_CQ_UHW_PACK out of memory\n");
 		return -ENOMEM;
 	}
-	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
-	uhw->in_buf = inbuf;
-	uhw->in_len = e->plugin_blob.len;
+	in->vm_pgoff = vm_pgoff;
+	uhw->in_buf = in;
+	uhw->in_len = sizeof(*in);
 
-	pr_debug("rxe: RESTORE_CQ_UHW_PACK ufile_handle=%u vm_pgoff=%#" PRIx64 " image_bytes=%u (uhw_in=%zu uhw_out=%zu)\n",
-		 e->has_ufile_handle ? e->ufile_handle : 0, vm_pgoff, pb->cqe_image_bytes, uhw->in_len, uhw->out_len);
+	pr_debug("rxe: RESTORE_CQ_UHW_PACK handle=%u vm_pgoff=%#" PRIx64 "\n",
+		 e->has_ufile_handle ? e->ufile_handle : 0, vm_pgoff);
 	return 0;
 }
 
@@ -1481,9 +1557,22 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
  */
 static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
 {
+	const struct rxe_qp_plugin_blob *pb;
 	struct rxe_create_qp_resp_local *out;
 
 	if (!e || !uhw)
+		return -EINVAL;
+	if (!e->has_plugin_blob || e->plugin_blob.len != sizeof(*pb))
+		return -EINVAL;
+	pb = (const struct rxe_qp_plugin_blob *)e->plugin_blob.data;
+	if (rxe_queue_mapping_add(rxe_ibdev_name, pb->sq_vm_pgoff,
+				  pb->sq_queue_size, e->ufile_id,
+				  RXE_QUEUE_SQ))
+		return -EINVAL;
+	if (pb->rq_vm_pgoff &&
+	    rxe_queue_mapping_add(rxe_ibdev_name, pb->rq_vm_pgoff,
+				  pb->rq_queue_size, e->ufile_id,
+				  RXE_QUEUE_RQ))
 		return -EINVAL;
 
 	out = calloc(1, sizeof(*out));
@@ -1493,6 +1582,8 @@ static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, stru
 	}
 	uhw->out_buf = out;
 	uhw->out_len = sizeof(*out);
+	out->rq_mi_offset = pb->rq_vm_pgoff;
+	out->sq_mi_offset = pb->sq_vm_pgoff;
 	uhw->verify_len = 0;
 	return 0;
 }
@@ -1527,6 +1618,7 @@ static int rdma_rxe_plugin_update_vma_map(const char *path, const uint64_t addr,
 					  uint64_t *new_pgoff, int *plugin_fd)
 {
 	struct stat st;
+	struct rxe_queue_mapping *mapping;
 	char ibdev[64];
 	int cached_fd, dup_fd;
 
@@ -1542,7 +1634,10 @@ static int rdma_rxe_plugin_update_vma_map(const char *path, const uint64_t addr,
 	if (rxe_chrdev_to_ibdev(st.st_rdev, ibdev, sizeof(ibdev)) < 0)
 		return -ENOTSUP;
 
-	cached_fd = rxe_cdev_cache_lookup(ibdev);
+	mapping = rxe_queue_mapping_find(ibdev, old_pgoff, 1);
+	if (!mapping || !mapping->ufile_id)
+		return -ENOTSUP;
+	cached_fd = rxe_cdev_cache_lookup(ibdev, mapping->ufile_id);
 	if (cached_fd < 0) {
 		pr_warn("update_vma_map: ibdev=%s not in cache (path=%s); open_uverbs_cdev did not run for this VMA's "
 			"cdev. Falling through.\n",
