@@ -1262,12 +1262,13 @@ _Static_assert(sizeof(struct rxe_create_qp_resp_local) == 32, "rxe_create_qp_res
  *
  * Returns 0 on success, -errno on failure.
  */
-static int rxe_query_qp(int fd, uint32_t qp_handle, struct rxe_restore_qp_req_local *req_out, uint64_t *user_handle_out,
-			void *sq_img, void *rq_img, void *res_img, uint32_t img_cap)
+static int rxe_query_qp(int fd, uint32_t qp_handle,
+			struct rxe_restore_qp_req_local *req_out,
+			uint64_t *user_handle_out)
 {
 	struct {
 		struct ib_uverbs_ioctl_hdr hdr;
-		struct ib_uverbs_attr attrs[6];
+		struct ib_uverbs_attr attrs[3];
 	} cmd = {};
 	unsigned int n = 0;
 
@@ -1292,30 +1293,6 @@ static int rxe_query_qp(int fd, uint32_t qp_handle, struct rxe_restore_qp_req_lo
 	cmd.attrs[n].flags = UVERBS_ATTR_F_MANDATORY;
 	cmd.attrs[n].data = (uintptr_t)user_handle_out;
 	n++;
-
-	if (sq_img && img_cap) {
-		cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE_LOCAL;
-		cmd.attrs[n].len = img_cap;
-		cmd.attrs[n].flags = 0;
-		cmd.attrs[n].data = (uintptr_t)sq_img;
-		n++;
-	}
-
-	if (rq_img && img_cap) {
-		cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE_LOCAL;
-		cmd.attrs[n].len = img_cap;
-		cmd.attrs[n].flags = 0;
-		cmd.attrs[n].data = (uintptr_t)rq_img;
-		n++;
-	}
-
-	if (res_img && img_cap) {
-		cmd.attrs[n].attr_id = RXE_IB_ATTR_QUERY_QP_RESP_RES_LOCAL;
-		cmd.attrs[n].len = img_cap;
-		cmd.attrs[n].flags = 0;
-		cmd.attrs[n].data = (uintptr_t)res_img;
-		n++;
-	}
 
 	cmd.hdr.num_attrs = n;
 	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
@@ -1348,81 +1325,28 @@ static int rdma_rxe_plugin_dump_uobj_qp(const char *ibdev, uint32_t kernel_drive
 {
 	struct rxe_restore_qp_req_local req = {};
 	uint64_t user_handle = 0;
-	uint8_t *sq_img = NULL, *rq_img = NULL, *res_img = NULL;
-	uint8_t *buf;
-	size_t total, off;
 	int rc;
 
 	(void)kernel_driver_id;
 	(void)pid;
 
-	/* One scratch slab, three per-image regions the kernel writes into. */
-	sq_img = malloc((size_t)RXE_QP_IMAGE_CAP_LOCAL * 3);
-	if (!sq_img) {
-		pr_err("rxe: dump_uobj_qp: out of memory for image buffers (handle=%u)\n", ufile_handle);
-		return -ENOMEM;
-	}
-	rq_img = sq_img + RXE_QP_IMAGE_CAP_LOCAL;
-	res_img = sq_img + (size_t)RXE_QP_IMAGE_CAP_LOCAL * 2;
-
-	rc = rxe_query_qp(lfd, ufile_handle, &req, &user_handle, sq_img, rq_img, res_img, RXE_QP_IMAGE_CAP_LOCAL);
+	rc = rxe_query_qp(lfd, ufile_handle, &req, &user_handle);
 	if (rc) {
 		pr_err("rxe: dump_uobj_qp: QUERY_QP(handle=%u) on ibdev=%s failed: %d (%s)\n", ufile_handle, ibdev, rc,
 		       strerror(-rc));
-		goto out;
+		return rc;
 	}
-
-	/*
-	 * Defence in depth: the kernel already -ENOSPCs an image that
-	 * overflows the advertised cap, but reject a reported length larger
-	 * than the buffer we passed (a report inconsistent with the ioctl).
-	 */
-	if (req.sq_image_bytes > RXE_QP_IMAGE_CAP_LOCAL || req.rq_image_bytes > RXE_QP_IMAGE_CAP_LOCAL ||
-	    req.res_image_bytes > RXE_QP_IMAGE_CAP_LOCAL) {
-		pr_err("rxe: QP handle=%u on ibdev=%s: in-flight image exceeds the %u-byte cap "
-		       "(sq=%u rq=%u res=%u); deep-ring chunking is a kernel-side follow-up\n",
-		       ufile_handle, ibdev, RXE_QP_IMAGE_CAP_LOCAL, req.sq_image_bytes, req.rq_image_bytes,
-		       req.res_image_bytes);
-		rc = -E2BIG;
-		goto out;
-	}
-
-	total = sizeof(req) + req.sq_image_bytes + req.rq_image_bytes + req.res_image_bytes;
-	buf = malloc(total);
-	if (!buf) {
-		pr_err("rxe: dump_uobj_qp: out of memory packing plugin_blob (handle=%u, %zu bytes)\n", ufile_handle,
-		       total);
-		rc = -ENOMEM;
-		goto out;
-	}
-	memcpy(buf, &req, sizeof(req));
-	off = sizeof(req);
-	if (req.sq_image_bytes) {
-		memcpy(buf + off, sq_img, req.sq_image_bytes);
-		off += req.sq_image_bytes;
-	}
-	if (req.rq_image_bytes) {
-		memcpy(buf + off, rq_img, req.rq_image_bytes);
-		off += req.rq_image_bytes;
-	}
-	if (req.res_image_bytes)
-		memcpy(buf + off, res_img, req.res_image_bytes);
-
-	plugin_blob->data = buf;
-	plugin_blob->len = total;
+	plugin_blob->data = NULL;
+	plugin_blob->len = 0;
 
 	qp_attrs->has_user_handle = true;
 	qp_attrs->user_handle = user_handle;
 
 	pr_info("rxe: dump_uobj_qp: ibdev=%s handle=%u qpn=%u sq_vm_pgoff=%#" PRIx64 " rq_vm_pgoff=%#" PRIx64
-		" psn(sq=%u rq=%u req=%u comp=%u resp=%u) img(sq=%u rq=%u res=%u) user_handle=%#" PRIx64 " blob=%zu\n",
-		ibdev, ufile_handle, req.qpn, (uint64_t)req.sq_vm_pgoff, (uint64_t)req.rq_vm_pgoff, req.sq_psn,
-		req.rq_psn, req.req_psn, req.comp_psn, req.resp_psn, req.sq_image_bytes, req.rq_image_bytes,
-		req.res_image_bytes, (uint64_t)user_handle, total);
-	rc = 0;
-out:
-	free(sq_img);
-	return rc;
+		" user_handle=%#" PRIx64 "\n",
+		ibdev, ufile_handle, req.qpn, (uint64_t)req.sq_vm_pgoff, (uint64_t)req.rq_vm_pgoff,
+		(uint64_t)user_handle);
+	return 0;
 }
 
 /*
@@ -1524,76 +1448,19 @@ static int rdma_rxe_plugin_restore_uobj_cq_uhw_pack(const RdmaUobjEntry *e, stru
  */
 static int rdma_rxe_plugin_restore_uobj_qp_uhw_pack(const RdmaUobjEntry *e, struct rdma_uhw_spec *uhw)
 {
-	const struct rxe_restore_qp_req_local *pb;
 	struct rxe_create_qp_resp_local *out;
-	void *inbuf;
 
 	if (!e || !uhw)
 		return -EINVAL;
 
-	if (!e->has_plugin_blob || e->plugin_blob.len < sizeof(*pb)) {
-		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu below the %zu-byte header\n",
-		       e->has_ufile_handle ? e->ufile_handle : 0, e->has_plugin_blob ? e->plugin_blob.len : (size_t)0,
-		       sizeof(*pb));
-		return -EINVAL;
-	}
-	pb = (const struct rxe_restore_qp_req_local *)e->plugin_blob.data;
-
-	{
-		size_t want = sizeof(*pb) + (size_t)pb->sq_image_bytes + pb->rq_image_bytes + pb->res_image_bytes;
-
-		if (e->plugin_blob.len != want) {
-			pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: plugin_blob len=%zu, expected %zu (%zuB "
-			       "header + img sq=%u rq=%u res=%u tail)\n",
-			       e->has_ufile_handle ? e->ufile_handle : 0, e->plugin_blob.len, want, sizeof(*pb),
-			       pb->sq_image_bytes, pb->rq_image_bytes, pb->res_image_bytes);
-			return -EINVAL;
-		}
-	}
-
-	if (pb->qpn == 0) {
-		pr_err("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u: captured qpn is 0 (the kernel installs at the "
-		       "source qpn and rejects 0)\n",
-		       e->has_ufile_handle ? e->ufile_handle : 0);
-		return -EINVAL;
-	}
-
-	out = malloc(sizeof(*out));
+	out = calloc(1, sizeof(*out));
 	if (!out) {
 		pr_err("rxe: RESTORE_QP_UHW_PACK out of memory (out_buf %zu bytes)\n", sizeof(*out));
 		return -ENOMEM;
 	}
-	memset(out, 0, sizeof(*out));
-	out->rq_mi_offset = pb->rq_vm_pgoff;
-	out->sq_mi_offset = pb->sq_vm_pgoff;
 	uhw->out_buf = out;
 	uhw->out_len = sizeof(*out);
-	/*
-	 * The verify mechanism is a single contiguous prefix memcmp, so it
-	 * can only cover rq_mi.offset (bytes 0..7); rq_mi.size/pad follow
-	 * and are kernel-assigned. rxe forces both ring offsets from the
-	 * same restore path, so a honoured rq offset is a sufficient proxy
-	 * that sq was honoured too.
-	 */
-	uhw->verify_len = pb->rq_vm_pgoff ? sizeof(out->rq_mi_offset) : 0;
-
-	inbuf = malloc(e->plugin_blob.len);
-	if (!inbuf) {
-		free(out);
-		uhw->out_buf = NULL;
-		uhw->out_len = 0;
-		uhw->verify_len = 0;
-		pr_err("rxe: RESTORE_QP_UHW_PACK out of memory (in_buf %zu bytes)\n", e->plugin_blob.len);
-		return -ENOMEM;
-	}
-	memcpy(inbuf, e->plugin_blob.data, e->plugin_blob.len);
-	uhw->in_buf = inbuf;
-	uhw->in_len = e->plugin_blob.len;
-
-	pr_debug("rxe: RESTORE_QP_UHW_PACK ufile_handle=%u qpn=%u sq_vm_pgoff=%#" PRIx64 " rq_vm_pgoff=%#" PRIx64
-		 " (uhw_in=%zu uhw_out=%zu)\n",
-		 e->has_ufile_handle ? e->ufile_handle : 0, pb->qpn, (uint64_t)pb->sq_vm_pgoff,
-		 (uint64_t)pb->rq_vm_pgoff, uhw->in_len, uhw->out_len);
+	uhw->verify_len = 0;
 	return 0;
 }
 
