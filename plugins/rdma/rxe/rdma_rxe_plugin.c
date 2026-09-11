@@ -314,9 +314,6 @@ static int rdma_rxe_plugin_init(int stage)
 
 static void rdma_rxe_plugin_fini(int stage, int ret)
 {
-	if (stage == CR_PLUGIN_STAGE__DUMP && !ret &&
-	    rxe_save_registered_contexts())
-		pr_err("Unable to save registered RXE contexts\n");
 	if (rxe_dump_control_fd >= 0) {
 		close(rxe_dump_control_fd);
 		rxe_dump_control_fd = -1;
@@ -333,6 +330,13 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 	 */
 	if (stage == CR_PLUGIN_STAGE__RESTORE)
 		rxe_cdev_cache_drop_all();
+}
+
+static int rdma_rxe_plugin_dump_devices_late(int pid)
+{
+	(void)pid;
+
+	return rxe_save_registered_contexts();
 }
 
 /*
@@ -1795,6 +1799,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP,
 			rdma_rxe_plugin_update_vma_map)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE,
 			rdma_rxe_plugin_resume_devices_late)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE,
+			rdma_rxe_plugin_dump_devices_late)
 
 /*
  * RDMA provided driver: RCD_RXE.
