@@ -1800,20 +1800,10 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES,
 CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(RDMA_CRIU_DRIVER__RCD_RXE);
 
 /*
- * RDMA sharing policy: SHAREABLE.
+ * RDMA sharing policy: EXCLUSIVE.
  *
- * rxe is a software provider whose per-uverbs-context state lives
- * entirely inside the kernel module's per-fd objects (uobjs, GIDs,
- * QP numbers etc.). Snapshotting and restoring one process's context
- * on rxe<N> does not touch the kernel state of any other live owner
- * of rxe<N>: there is no shared device-wide register file to
- * reconfigure, no firmware to flash, no DMA mappings to invalidate.
- *
- * The cross-tree exclusivity check (added with the pre-suspend
- * netlink pass) reads this declaration and skips other pids holding
- * rxe<N> contexts. Without it the safe default would be EXCLUSIVE and
- * we would refuse to dump any rxe-using process while another
- * rxe-using process exists on the same ibdev -- the wrong call for a
- * software provider.
+ * The RXE vHCA image covers all selected contexts on one ib_device.
+ * Until provider-owned coverage checks replace this temporary API,
+ * reject an out-of-tree context before freezing the device.
  */
-CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_SHAREABLE);
+CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_EXCLUSIVE);
