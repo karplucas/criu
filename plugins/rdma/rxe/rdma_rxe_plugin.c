@@ -826,7 +826,9 @@ static int rxe_match_cdev_vma(const struct stat *st, char *ibdev_out,
  * declines mlx5 cdev VMAs so the mlx5 plugin's own hook can claim
  * them.
  *
- * Returns 0 on a successful claim; -ENOTSUP on any decline (so
+ * Returns CR_PLUGIN_VMA_CONTENT on a successful claim because RXE uverbs
+ * mappings are ordinary queue storage whose bytes CRIU must preserve.
+ * Returns -ENOTSUP on any decline (so
  * run_plugins() keeps walking to other plugins, or falls through to
  * proc_parse's "Can't handle non-regular mapping" if none claim).
  * Never returns any other negative value: a non-ENOTSUP negative
@@ -849,7 +851,7 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
 	pr_info("handle_vma(%s): claiming uverbs-cdev mapping "
 		"(rxe per-uobject queue: CQ ring / QP rings / SRQ)\n",
 		ibdev);
-	return 0;
+	return CR_PLUGIN_VMA_CONTENT;
 }
 
 /*

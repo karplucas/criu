@@ -103,6 +103,7 @@
 #define VMA_AREA_UPROBES	(1 << 17)
 #define VMA_AREA_NOT_ACCOUNTABLE (1 << 18)
 
+#define VMA_EXT_PLUGIN_CONTENT (1 << 26)
 #define VMA_EXT_PLUGIN	  (1 << 27)
 #define VMA_CLOSE	  (1 << 28)
 #define VMA_NO_PROT_WRITE (1 << 29)

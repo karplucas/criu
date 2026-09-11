@@ -109,17 +109,17 @@ bool is_vma_range_fmt(char *line)
 	return __is_vma_range_fmt(line);
 }
 
-bool handle_vma_plugin(int *fd, struct stat *stat)
+static int handle_vma_plugin(int *fd, struct stat *stat)
 {
 	int ret;
 
 	ret = run_plugins(HANDLE_DEVICE_VMA, *fd, stat);
 	if (ret < 0) {
 		pr_perror("handle_device_vma plugin failed");
-		return false;
+		return ret;
 	}
 
-	return true;
+	return ret;
 }
 
 static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
@@ -664,13 +664,19 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 		} else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO)) {
 			/* devzero mapping -- also makes sense */;
 			pr_debug("Found devzero mapping, OK\n");
-		} else if (handle_vma_plugin(vm_file_fd, st_buf)) {
+		} else {
+			int plugin_ret = handle_vma_plugin(vm_file_fd, st_buf);
+
+			if (plugin_ret < 0) {
+				/* non-regular mapping with no supporting plugin */
+				pr_err("Can't handle non-regular mapping on %d's map %" PRIx64 "\n",
+				       pid, vma_area->e->start);
+				goto err;
+			}
 			pr_info("Found device file mapping, plugin is available\n");
 			vma_area->e->status |= VMA_EXT_PLUGIN;
-		} else {
-			/* non-regular mapping with no supporting plugin */
-			pr_err("Can't handle non-regular mapping on %d's map %" PRIx64 "\n", pid, vma_area->e->start);
-			goto err;
+			if (plugin_ret == CR_PLUGIN_VMA_CONTENT)
+				vma_area->e->status |= VMA_EXT_PLUGIN_CONTENT;
 		}
 
 		if ((is_anon_shmem_map(st_buf->st_dev) || is_hugetlb_dev(st_buf->st_dev, NULL)) &&

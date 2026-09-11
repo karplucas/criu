@@ -2491,8 +2491,8 @@ static int open_filemap(int pid, struct vma_area *vma)
 				vma->e->pgoff, new_pgoff, plugin_fd);
 			vma->e->pgoff = new_pgoff;
 		}
-		/* Device plugin will restore vma contents, so no need for write permission */
-		vma->e->status |= VMA_NO_PROT_WRITE;
+		if (!(vma->e->status & VMA_EXT_PLUGIN_CONTENT))
+			vma->e->status |= VMA_NO_PROT_WRITE;
 	}
 
 	if (ctx.flags != flags || ctx.desc != vma->vmfd) {

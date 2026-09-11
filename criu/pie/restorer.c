@@ -929,7 +929,9 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 		flags |= MAP_ANONYMOUS;
 
 	/* A mapping of file with MAP_SHARED is up to date */
-	if ((vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED)) && !(vma_entry->status & VMA_NO_PROT_WRITE))
+	if ((vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED) ||
+	     (vma_entry->status & VMA_EXT_PLUGIN_CONTENT)) &&
+	    !(vma_entry->status & VMA_NO_PROT_WRITE))
 		prot |= PROT_WRITE;
 
 	/* TODO: Drop MAP_LOCKED bit and restore it after reading memory.
