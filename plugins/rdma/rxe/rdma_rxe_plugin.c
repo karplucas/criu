@@ -37,6 +37,7 @@
 #include "plugin.h"
 
 #include "images/rdma_criu.pb-c.h"
+#include "rxe_image.h"
 
 #include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/ib_user_ioctl_verbs.h>
@@ -100,6 +101,22 @@ struct rxe_alloc_ucontext_req_local {
  */
 static bool rxe_active = false;
 static int rxe_dev_count = 0;
+static char rxe_ibdev_name[64];
+static bool rxe_image_saved;
+
+#define RXE_UVERBS_ID_NS_SHIFT_LOCAL		12
+#define RXE_IB_OBJECT_MIGRATE_LOCAL		(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_OBJECT_VHCA_STREAM_LOCAL		((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define RXE_IB_METHOD_CREATE_SAVE_FD_LOCAL	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_METHOD_CREATE_LOAD_FD_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define RXE_IB_METHOD_LOAD_VHCA_LOCAL		((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH_LOCAL ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
+#define RXE_IB_ATTR_LOAD_VHCA_HANDLE_LOCAL	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+
+static int rxe_load_image_on_restore(void);
+static int rxe_create_save_fd(int control_fd);
 
 /*
  * Restore-side cache of cdev fds that already carry a kernel ucontext
@@ -228,6 +245,8 @@ static int rdma_rxe_plugin_init(int stage)
 
 	rxe_active = false;
 	rxe_dev_count = 0;
+	rxe_ibdev_name[0] = '\0';
+	rxe_image_saved = false;
 
 	d = opendir(IBDEV_SYSFS_DIR);
 	if (!d) {
@@ -255,8 +274,13 @@ static int rdma_rxe_plugin_init(int stage)
 
 		pr_debug("ibdev %s -> driver %s\n", de->d_name, drv);
 
-		if (!strcmp(drv, "rxe"))
+		if (!strcmp(drv, "rxe")) {
+			if (!rxe_dev_count)
+				snprintf(rxe_ibdev_name, sizeof(rxe_ibdev_name),
+					 "%.*s", (int)sizeof(rxe_ibdev_name) - 1,
+					 de->d_name);
 			rxe_dev_count++;
+		}
 	}
 
 	closedir(d);
@@ -269,6 +293,9 @@ static int rdma_rxe_plugin_init(int stage)
 		pr_info("inactive (stage %d): no rxe ibdevs on this host\n",
 			stage);
 	}
+
+	if (stage == CR_PLUGIN_STAGE__RESTORE && rxe_load_image_on_restore())
+		return -1;
 
 	/*
 	 * Returning zero unconditionally so the .so stays loaded even when
@@ -329,6 +356,41 @@ static int rdma_rxe_plugin_claim_uverbs_context(const char *ibdev, uint32_t kern
 	return RDMA_CRIU_DRIVER__RCD_RXE;
 }
 
+static int rdma_rxe_plugin_dump_uverbs_context(const char *ibdev,
+					       uint32_t kernel_driver_id,
+					       uint32_t ctxn, int lfd,
+					       pid_t pid)
+{
+	uint64_t image_size;
+	int save_fd;
+
+	(void)ctxn;
+	(void)pid;
+	if (kernel_driver_id != RDMA_DRIVER_RXE)
+		return -ENOTSUP;
+	if (rxe_image_saved)
+		return 0;
+	if (rxe_dev_count != 1 || strcmp(ibdev, rxe_ibdev_name)) {
+		pr_err("RXE image capture currently requires one RXE device\n");
+		return -1;
+	}
+
+	save_fd = rxe_create_save_fd(lfd);
+	if (save_fd < 0) {
+		pr_err("CREATE_SAVE_FD failed: %s\n", strerror(-save_fd));
+		return -1;
+	}
+	if (rxe_image_save(save_fd, &image_size)) {
+		close(save_fd);
+		return -1;
+	}
+	close(save_fd);
+	rxe_image_saved = true;
+	pr_info("Saved %s (%" PRIu64 " bytes) for %s\n",
+		RXE_MIG_IMAGE_NAME, image_size, ibdev);
+	return 0;
+}
+
 /*
  * Read a single-line sysfs attribute into @buf, NUL-terminated with a
  * trailing newline trimmed. Returns 0 on success, -1 on any error.
@@ -348,6 +410,148 @@ static int rxe_read_sysfs(const char *path, char *buf, size_t buflen)
 	if (n > 0 && buf[n - 1] == '\n')
 		buf[n - 1] = '\0';
 	return 0;
+}
+
+static int rxe_open_cdev(const char *wanted_ibdev)
+{
+	char path[PATH_MAX];
+	char ibdev[64];
+	struct dirent *de;
+	DIR *directory;
+	int fd = -1;
+
+	directory = opendir(IB_UVERBS_CLASS_DIR);
+	if (!directory)
+		return -1;
+
+	while ((de = readdir(directory)) != NULL) {
+		if (strncmp(de->d_name, "uverbs", 6))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s/ibdev",
+			 IB_UVERBS_CLASS_DIR, de->d_name);
+		if (rxe_read_sysfs(path, ibdev, sizeof(ibdev)) ||
+		    strcmp(ibdev, wanted_ibdev))
+			continue;
+		snprintf(path, sizeof(path), "/dev/infiniband/%s", de->d_name);
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		break;
+	}
+
+	closedir(directory);
+	return fd;
+}
+
+static int rxe_create_save_fd(int control_fd)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attr;
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_VHCA_STREAM_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_CREATE_SAVE_FD_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd);
+	cmd.attr.attr_id = RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE_LOCAL;
+	cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
+
+	if (ioctl(control_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return (int)cmd.attr.data;
+}
+
+static int rxe_create_load_fd(int control_fd, uint64_t length)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_VHCA_STREAM_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_CREATE_LOAD_FD_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+	cmd.hdr.num_attrs = 2;
+	cmd.hdr.length = sizeof(cmd);
+	cmd.attrs[0].attr_id = RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE_LOCAL;
+	cmd.attrs[0].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].attr_id = RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH_LOCAL;
+	cmd.attrs[1].len = sizeof(length);
+	cmd.attrs[1].flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[1].data = length;
+
+	if (ioctl(control_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return (int)cmd.attrs[0].data;
+}
+
+static int rxe_load_vhca(int control_fd, int load_fd)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attr;
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_VHCA_STREAM_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_LOAD_VHCA_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd);
+	cmd.attr.attr_id = RXE_IB_ATTR_LOAD_VHCA_HANDLE_LOCAL;
+	cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attr.data = load_fd;
+
+	if (ioctl(control_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+static int rxe_load_image_on_restore(void)
+{
+	uint64_t length;
+	int control_fd;
+	int load_fd;
+	int ret = -1;
+
+	if (faccessat(criu_get_image_dir(), RXE_MIG_IMAGE_NAME, F_OK, 0)) {
+		if (errno == ENOENT)
+			return 0;
+		pr_perror("Unable to inspect %s", RXE_MIG_IMAGE_NAME);
+		return -1;
+	}
+	if (rxe_dev_count != 1) {
+		pr_err("%s requires exactly one destination RXE device; found %d\n",
+		       RXE_MIG_IMAGE_NAME, rxe_dev_count);
+		return -1;
+	}
+	if (rxe_image_get_size(&length))
+		return -1;
+
+	control_fd = rxe_open_cdev(rxe_ibdev_name);
+	if (control_fd < 0) {
+		pr_perror("Unable to open RXE control cdev for %s",
+			  rxe_ibdev_name);
+		return -1;
+	}
+	load_fd = rxe_create_load_fd(control_fd, length);
+	if (load_fd < 0) {
+		pr_err("CREATE_LOAD_FD failed: %s\n", strerror(-load_fd));
+		goto out_control;
+	}
+	if (rxe_image_load(load_fd, length))
+		goto out_load;
+	ret = rxe_load_vhca(control_fd, load_fd);
+	if (ret) {
+		pr_err("LOAD_VHCA failed: %s\n", strerror(-ret));
+		ret = -1;
+		goto out_load;
+	}
+	ret = 0;
+out_load:
+	close(load_fd);
+out_control:
+	close(control_fd);
+	return ret;
 }
 
 /*
@@ -610,8 +814,6 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st)
  * RESUME_VHCA=+4. Keep in sync with the kernel UAPI; remove once host
  * rdma-core ships them.
  */
-#define RXE_UVERBS_ID_NS_SHIFT_LOCAL	     12
-#define RXE_IB_OBJECT_MIGRATE_LOCAL	     (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_METHOD_QUERY_CQ_LOCAL	     ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 #define RXE_IB_ATTR_QUERY_CQ_HANDLE_LOCAL    (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_QUERY_CQ_RESP_BLOB_LOCAL ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
@@ -1529,6 +1731,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT,
 			rdma_rxe_plugin_claim_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV,
 			rdma_rxe_plugin_open_uverbs_cdev)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT,
+			rdma_rxe_plugin_dump_uverbs_context)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA,
 			rdma_rxe_plugin_handle_device_vma)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RDMA_DUMP_UOBJ_CQ,
