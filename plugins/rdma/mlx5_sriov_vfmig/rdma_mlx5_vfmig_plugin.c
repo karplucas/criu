@@ -408,22 +408,6 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, rdma_mlx5_vfmig_plugin_u
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, rdma_mlx5_vfmig_plugin_resume_devices_late)
 
 /*
- * RDMA sharing policy: EXCLUSIVE.
- *
- * mlx5 SR-IOV VF migration snapshots and restores the entire VF as one
- * atomic unit (the QUERY_VF / SAVE_VF / LOAD_VF ioctls all operate at
- * VF granularity, not per-uverbs-context). Any context another process
- * holds on the same VF will be invalidated by the eventual LOAD_VF on
- * the destination -- the device-side state (queue pairs, completion
- * queues, memory keys) gets fully replaced with the snapshot, so by the
- * time the restored process resumes the cohabiting process's
- * hardware-backed handles point at stale or freed objects. The
- * cross-tree exclusivity check refuses a dump in which the snapshot
- * tree shares a tracked VF with any pid not in the snapshot.
- */
-CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_EXCLUSIVE);
-
-/*
  * RDMA provided driver: RCD_MLX5_SRIOV_VFMIG.
  *
  * Symmetric with the RCD_MLX5_SRIOV_VFMIG return value of the claim

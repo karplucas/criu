@@ -11,10 +11,8 @@
  *       device.
  *
  *   rdma_check_cross_tree_exclusivity()
- *       For every snapshot-tree context, look at non-snapshot pids
- *       holding contexts on the same ibdev; reject the dump if the
- *       claiming plugin marks the device EXCLUSIVE (mlx5 SR-IOV VF
- *       migration is the canonical EXCLUSIVE case).
+ *       Reject an image-device save when a context on that device is
+ *       owned by a process outside the snapshot tree.
  *
  * Both walk the full host context list via rdma_nl_for_each_context()
  * rather than off /proc/<pid>/fdinfo so they can see contexts that
@@ -213,17 +211,11 @@ int rdma_check_dump_coverage(struct pstree_item *root)
  *      analysis is "for ibdev D, is there an in-tree pid AND an
  *      out-of-tree pid?", which is a join, not a stream filter.
  *
- *   2. Group tuples by ibdev. For each ibdev where any tree pid holds
- *      a context, look at the non-tree pids on the same ibdev (if
- *      any). For each such ibdev, ask the claiming plugin's
- *      exclusivity policy via rdma_plugin_sharing_policy_by_name().
+ *   2. Group tuples by ibdev. Reject a device used by both an in-tree
+ *      and an out-of-tree process. Current RDMA image providers save a
+ *      whole device or VF, so a partial context set is not valid.
  *
- *   3. If the plugin is EXCLUSIVE (or doesn't declare a policy -- safe
- *      default), fail with an actionable error naming both the in-tree
- *      and out-of-tree pids and pointing the operator at the offending
- *      non-snapshot process they need to deal with first.
- *
- *   4. There is a small TOCTOU window between this check and the
+ *   3. There is a small TOCTOU window between this check and the
  *      eventual restore (or even between this check and SIGSTOP): a
  *      non-tree process could open a fresh context after we look. A
  *      future "freeze the RDMA subsystem to new uverbs opens" locking
@@ -329,11 +321,6 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root)
 	ret = 0;
 	for (i = 0; i < cc.n_tuples && ret == 0; i++) {
 		struct cross_tree_tuple *ti = &cc.tuples[i];
-		const char *claimer = NULL;
-		uint32_t kdrv;
-		char driver[64];
-		int policy;
-		int rcd;
 
 		if (!tuple_pid_in_tree(&cc, ti->pid))
 			continue;
@@ -348,46 +335,9 @@ int rdma_check_cross_tree_exclusivity(struct pstree_item *root)
 			if (tuple_pid_in_tree(&cc, tj->pid))
 				continue;
 
-			/*
-			 * (ti->pid in tree) holds a context on ibdev,
-			 * (tj->pid not in tree) also holds a context on the
-			 * same ibdev. Ask the claiming plugin if that's a
-			 * problem.
-			 */
-			if (rdma_driver_name_from_ibdev(ti->ibdev, driver, sizeof(driver))) {
-				pr_err("cross-tree exclusivity: cannot resolve driver for ibdev=%s\n", ti->ibdev);
-				ret = -1;
-				break;
-			}
-			kdrv = rdma_driver_name_to_id(driver);
-			rcd = rdma_arbitrate_plugin_claim(ti->ibdev, kdrv, &claimer);
-			if (rcd <= 0) {
-				/*
-				 * Coverage check should have rejected this
-				 * already. Treat as a hard failure -- if we
-				 * got here something racy happened.
-				 */
-				pr_err("cross-tree exclusivity: ibdev=%s lost its claim between coverage and "
-				       "exclusivity checks (rcd=%d)\n",
-				       ti->ibdev, rcd);
-				ret = -1;
-				break;
-			}
-
-			policy = rdma_plugin_sharing_policy_by_name(claimer);
-			if (policy == CR_RDMA_SHARING_SHAREABLE) {
-				pr_debug("cross-tree exclusivity: ibdev=%s shared between in-tree pid %d and "
-					 "out-of-tree pid %d, but plugin '%s' is SHAREABLE -- OK\n",
-					 ti->ibdev, ti->pid, tj->pid, claimer);
-				continue;
-			}
-
-			pr_err("cross-tree RDMA exclusivity: in-tree pid %d and out-of-tree pid %d both hold "
-			       "contexts on ibdev=%s, and the claiming plugin '%s' marks this device EXCLUSIVE. "
-			       "Snapshotting and restoring would destroy pid %d's context. Either include pid %d "
-			       "in the snapshot, stop it before dumping, or switch the device's claiming plugin to "
-			       "a sharing-aware one.\n",
-			       ti->pid, tj->pid, ti->ibdev, claimer, tj->pid, tj->pid);
+			pr_err("RDMA image for ibdev=%s omits context owned by pid %d "
+			       "outside the snapshot tree (in-tree pid %d)\n",
+			       ti->ibdev, tj->pid, ti->pid);
 			ret = -1;
 			break;
 		}

@@ -1893,12 +1893,3 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES,
  * RCD_RXE.
  */
 CR_PLUGIN_DECLARE_RDMA_PROVIDED_DRIVER(RDMA_CRIU_DRIVER__RCD_RXE);
-
-/*
- * RDMA sharing policy: EXCLUSIVE.
- *
- * The RXE vHCA image covers all selected contexts on one ib_device.
- * Until provider-owned coverage checks replace this temporary API,
- * reject an out-of-tree context before freezing the device.
- */
-CR_PLUGIN_DECLARE_RDMA_SHARING(CR_RDMA_SHARING_EXCLUSIVE);
