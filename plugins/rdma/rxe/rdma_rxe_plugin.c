@@ -91,6 +91,7 @@
 
 struct rxe_alloc_ucontext_req_local {
 	uint32_t flags;
+	uint32_t ufile_id;
 	uint32_t reserved;
 };
 
@@ -102,7 +103,7 @@ struct rxe_alloc_ucontext_req_local {
 static bool rxe_active = false;
 static int rxe_dev_count = 0;
 static char rxe_ibdev_name[64];
-static bool rxe_image_saved;
+static int rxe_dump_control_fd = -1;
 
 #define RXE_UVERBS_ID_NS_SHIFT_LOCAL		12
 #define RXE_IB_OBJECT_MIGRATE_LOCAL		(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
@@ -110,13 +111,16 @@ static bool rxe_image_saved;
 #define RXE_IB_METHOD_CREATE_SAVE_FD_LOCAL	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_METHOD_CREATE_LOAD_FD_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_METHOD_LOAD_VHCA_LOCAL		((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
+#define RXE_IB_METHOD_REGISTER_CONTEXT_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 5)
 #define RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH_LOCAL ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_ATTR_LOAD_VHCA_HANDLE_LOCAL	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 
 static int rxe_load_image_on_restore(void);
 static int rxe_create_save_fd(int control_fd);
+static int rxe_save_registered_contexts(void);
 
 /*
  * Restore-side cache of cdev fds that already carry a kernel ucontext
@@ -246,7 +250,9 @@ static int rdma_rxe_plugin_init(int stage)
 	rxe_active = false;
 	rxe_dev_count = 0;
 	rxe_ibdev_name[0] = '\0';
-	rxe_image_saved = false;
+	if (rxe_dump_control_fd >= 0)
+		close(rxe_dump_control_fd);
+	rxe_dump_control_fd = -1;
 
 	d = opendir(IBDEV_SYSFS_DIR);
 	if (!d) {
@@ -308,6 +314,14 @@ static int rdma_rxe_plugin_init(int stage)
 
 static void rdma_rxe_plugin_fini(int stage, int ret)
 {
+	if (stage == CR_PLUGIN_STAGE__DUMP && !ret &&
+	    rxe_save_registered_contexts())
+		pr_err("Unable to save registered RXE contexts\n");
+	if (rxe_dump_control_fd >= 0) {
+		close(rxe_dump_control_fd);
+		rxe_dump_control_fd = -1;
+	}
+
 	pr_info("fini (stage %d ret %d): was %s, %d rxe ibdev(s)\n", stage,
 		ret, rxe_active ? "active" : "inactive", rxe_dev_count);
 
@@ -358,24 +372,58 @@ static int rdma_rxe_plugin_claim_uverbs_context(const char *ibdev, uint32_t kern
 
 static int rdma_rxe_plugin_dump_uverbs_context(const char *ibdev,
 					       uint32_t kernel_driver_id,
+					       uint32_t ufile_id,
 					       uint32_t ctxn, int lfd,
 					       pid_t pid)
 {
-	uint64_t image_size;
-	int save_fd;
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attr;
+	} cmd = {};
 
-	(void)ctxn;
 	(void)pid;
 	if (kernel_driver_id != RDMA_DRIVER_RXE)
 		return -ENOTSUP;
-	if (rxe_image_saved)
-		return 0;
 	if (rxe_dev_count != 1 || strcmp(ibdev, rxe_ibdev_name)) {
 		pr_err("RXE image capture currently requires one RXE device\n");
 		return -1;
 	}
 
-	save_fd = rxe_create_save_fd(lfd);
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_REGISTER_CONTEXT_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd);
+	cmd.attr.attr_id = RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID_LOCAL;
+	cmd.attr.len = sizeof(ufile_id);
+	cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attr.data = ufile_id;
+	if (ioctl(lfd, RDMA_VERBS_IOCTL, &cmd) < 0) {
+		pr_perror("REGISTER_CONTEXT(ufile_id=%#x ctxn=%u)",
+			  ufile_id, ctxn);
+		return -1;
+	}
+
+	if (rxe_dump_control_fd < 0) {
+		rxe_dump_control_fd = fcntl(lfd, F_DUPFD_CLOEXEC,
+					    RXE_CACHED_FD_FLOOR);
+		if (rxe_dump_control_fd < 0) {
+			pr_perror("Unable to retain RXE dump control fd");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int rxe_save_registered_contexts(void)
+{
+	uint64_t image_size;
+	int save_fd;
+
+	if (rxe_dump_control_fd < 0)
+		return 0;
+	save_fd = rxe_create_save_fd(rxe_dump_control_fd);
 	if (save_fd < 0) {
 		pr_err("CREATE_SAVE_FD failed: %s\n", strerror(-save_fd));
 		return -1;
@@ -385,9 +433,8 @@ static int rdma_rxe_plugin_dump_uverbs_context(const char *ibdev,
 		return -1;
 	}
 	close(save_fd);
-	rxe_image_saved = true;
 	pr_info("Saved %s (%" PRIu64 " bytes) for %s\n",
-		RXE_MIG_IMAGE_NAME, image_size, ibdev);
+		RXE_MIG_IMAGE_NAME, image_size, rxe_ibdev_name);
 	return 0;
 }
 
@@ -575,7 +622,7 @@ out_control:
  *
  * Returns 0 on success, -errno on failure.
  */
-static int rxe_send_get_context_restore(int fd)
+static int rxe_send_get_context_restore(int fd, uint32_t ufile_id)
 {
 	struct {
 		struct ib_uverbs_cmd_hdr hdr;
@@ -590,6 +637,7 @@ static int rxe_send_get_context_restore(int fd)
 	cmd.hdr.out_words = sizeof(resp) / 4;
 	cmd.get_ctx.response = (uintptr_t)&resp;
 	cmd.req.flags = CRIU_RXE_ALLOC_UCTX_RESTORE_MODE;
+	cmd.req.ufile_id = ufile_id;
 
 	n = write(fd, &cmd, sizeof(cmd));
 	if (n < 0)
@@ -666,7 +714,7 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		return -1;
 	}
 
-	rc = rxe_send_get_context_restore(fd);
+	rc = rxe_send_get_context_restore(fd, uvfe->id);
 	if (rc) {
 		pr_err("open_uverbs_cdev: GET_CONTEXT(restore mode) on fd=%d for ibdev=%s failed: %d (%s)\n", fd,
 		       uvfe->ib_dev, rc, strerror(-rc));

@@ -446,7 +446,7 @@ DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_CLAIM_UVERBS_CONTEXT, const char *
 #include "images/uverbsfd.pb-c.h"
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_OPEN_UVERBS_CDEV, const UverbsFileEntry *uvfe);
 DECLARE_PLUGIN_HOOK_ARGS(CR_PLUGIN_HOOK__RDMA_DUMP_UVERBS_CONTEXT, const char *ibdev, uint32_t kernel_driver_id,
-			 uint32_t ctxn, int lfd, pid_t pid);
+			 uint32_t ufile_id, uint32_t ctxn, int lfd, pid_t pid);
 /*
  * The RdmaCqAttrs typedef and the ProtobufCBinaryData plugin-blob
  * byteslice resolve through images/rdma_uobj.pb-c.h -- same forward-

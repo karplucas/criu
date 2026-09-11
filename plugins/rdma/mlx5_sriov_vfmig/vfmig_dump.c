@@ -137,8 +137,8 @@ void vfmig_claimed_clear(void)
  * capture failure that must fail the dump. @kernel_driver_id and @pid
  * are unused -- the fd already targets the right context.
  */
-int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
-					       pid_t pid)
+int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ufile_id,
+					       uint32_t ctxn, int lfd, pid_t pid)
 {
 	struct mlx5_ib_vfmig_ucontext_meta_local meta;
 	struct mlx5_ib_vfmig_dyn_uar_record_local *dyn = NULL;
@@ -150,6 +150,7 @@ int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kerne
 	int rc;
 
 	(void)kernel_driver_id;
+	(void)ufile_id;
 	(void)pid;
 
 	if (!vfmig_active)

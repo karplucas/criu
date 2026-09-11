@@ -234,7 +234,7 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe)
  * operator's plugin set is inconsistent.
  */
 int rdma_dispatch_dump_uverbs_context(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id,
-				      uint32_t ctxn, int lfd, pid_t pid)
+				      uint32_t ufile_id, uint32_t ctxn, int lfd, pid_t pid)
 {
 	plugin_desc_t *this;
 	plugin_desc_t *winner = NULL;
@@ -275,7 +275,7 @@ int rdma_dispatch_dump_uverbs_context(uint32_t criu_driver, const char *ibdev, u
 	pr_debug("uverbs context dump: dispatching DUMP_UVERBS_CONTEXT to plugin '%s' (criu_driver=%u ibdev=%s "
 		 "ctxn=%u)\n",
 		 winner_name, criu_driver, ibdev ?: "?", ctxn);
-	return fn(ibdev, kernel_driver_id, ctxn, lfd, pid);
+	return fn(ibdev, kernel_driver_id, ufile_id, ctxn, lfd, pid);
 }
 
 /*

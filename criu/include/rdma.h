@@ -175,7 +175,7 @@ int rdma_dispatch_open_uverbs_cdev(const UverbsFileEntry *uvfe);
  *       failure.
  */
 int rdma_dispatch_dump_uverbs_context(uint32_t criu_driver, const char *ibdev, uint32_t kernel_driver_id,
-				      uint32_t ctxn, int lfd, pid_t pid);
+				      uint32_t ufile_id, uint32_t ctxn, int lfd, pid_t pid);
 
 /*
  * Dump-side per-CQ dispatch (criu/rdma/plugin_api.c):

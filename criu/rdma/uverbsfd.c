@@ -583,7 +583,8 @@ static int dump_uverbsfile(int lfd, u32 id, const struct fd_parms *p)
 	 * is the parasite-drained cdev fd, sharing the dumpee's ucontext
 	 * IDR, so the plugin can QUERY_UCONTEXT against it.
 	 */
-	if (rdma_dispatch_dump_uverbs_context(rcd, ibdev, uve.driver_id, uve.ctxn, lfd, p->pid) < 0) {
+	if (rdma_dispatch_dump_uverbs_context(rcd, ibdev, uve.driver_id,
+					       uve.id, uve.ctxn, lfd, p->pid) < 0) {
 		pr_err("Per-ucontext dump capture failed for ibdev=%s ctxn=%u\n", ibdev, uve.ctxn);
 		ret = -1;
 		goto out;

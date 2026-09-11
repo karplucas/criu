@@ -77,8 +77,8 @@ void vfmig_claimed_clear(void);
  * it into mlx5_vfmig.img. See the claimed-set note above for why the
  * snapshot rides on the claimed entry rather than a separate queue.
  */
-int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ctxn, int lfd,
-					       pid_t pid);
+int rdma_mlx5_vfmig_plugin_dump_uverbs_context(const char *ibdev, uint32_t kernel_driver_id, uint32_t ufile_id,
+					       uint32_t ctxn, int lfd, pid_t pid);
 
 /*
  * Per-PD dump capture. rdma_mlx5_vfmig_plugin_dump_uobj_pd() is the
