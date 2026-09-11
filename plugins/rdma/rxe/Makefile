@@ -17,7 +17,7 @@ include $(__nmk_dir)msg.mk
 
 all: $(DEPS_RDMA_RXE)
 
-rdma_rxe_plugin.so: rdma_rxe_plugin.c
+rdma_rxe_plugin.so: rdma_rxe_plugin.c rxe_image.c
 	$(call msg-gen, $@)
 	$(Q) $(CC) $(PLUGIN_CFLAGS) $(DEFINES) $(shell $(COMPEL) includes) $^ -o $@ $(PLUGIN_INCLUDE) $(PLUGIN_LDFLAGS)
 
