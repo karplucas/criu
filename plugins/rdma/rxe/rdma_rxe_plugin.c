@@ -112,11 +112,19 @@ static int rxe_dump_control_fd = -1;
 #define RXE_IB_METHOD_CREATE_LOAD_FD_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_METHOD_LOAD_VHCA_LOCAL		((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 2)
 #define RXE_IB_METHOD_REGISTER_CONTEXT_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 5)
+#define RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL	((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 3)
 #define RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH_LOCAL ((1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL) + 1)
 #define RXE_IB_ATTR_LOAD_VHCA_HANDLE_LOCAL	(1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
 #define RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+#define RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL (1u << RXE_UVERBS_ID_NS_SHIFT_LOCAL)
+
+struct rxe_frozen_context {
+	int fd;
+	struct rxe_frozen_context *next;
+};
+static struct rxe_frozen_context *rxe_frozen_contexts;
 
 static int rxe_load_image_on_restore(void);
 static int rxe_create_save_fd(int control_fd);
@@ -314,6 +322,31 @@ static int rdma_rxe_plugin_init(int stage)
 
 static void rdma_rxe_plugin_fini(int stage, int ret)
 {
+	struct rxe_frozen_context *frozen, *next;
+
+	for (frozen = rxe_frozen_contexts; frozen; frozen = next) {
+		uint8_t freeze = 0;
+		struct {
+			struct ib_uverbs_ioctl_hdr hdr;
+			struct ib_uverbs_attr attr;
+		} cmd = {};
+
+		next = frozen->next;
+		cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+		cmd.hdr.method_id = RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL;
+		cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+		cmd.hdr.num_attrs = 1;
+		cmd.hdr.length = sizeof(cmd);
+		cmd.attr.attr_id = RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL;
+		cmd.attr.len = sizeof(freeze);
+		cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
+		cmd.attr.data = (uintptr_t)&freeze;
+		if (ioctl(frozen->fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+			pr_perror("Unable to resume frozen RXE context");
+		close(frozen->fd);
+		free(frozen);
+	}
+	rxe_frozen_contexts = NULL;
 	if (rxe_dump_control_fd >= 0) {
 		close(rxe_dump_control_fd);
 		rxe_dump_control_fd = -1;
@@ -1547,6 +1580,89 @@ static int rxe_pidfd_getfd(int pidfd, int targetfd)
 	return syscall(__NR_pidfd_getfd, pidfd, targetfd, 0);
 }
 
+static int rxe_freeze_context(int fd)
+{
+	uint8_t freeze = 1;
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attr;
+	} cmd = {};
+
+	cmd.hdr.object_id = RXE_IB_OBJECT_MIGRATE_LOCAL;
+	cmd.hdr.method_id = RXE_IB_METHOD_FREEZE_CONTEXT_LOCAL;
+	cmd.hdr.driver_id = RDMA_DRIVER_RXE;
+	cmd.hdr.num_attrs = 1;
+	cmd.hdr.length = sizeof(cmd);
+	cmd.attr.attr_id = RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE_LOCAL;
+	cmd.attr.len = sizeof(freeze);
+	cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
+	cmd.attr.data = (uintptr_t)&freeze;
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	return 0;
+}
+
+static int rdma_rxe_plugin_checkpoint_devices(int pid)
+{
+	char fdpath[64];
+	struct dirent *de;
+	int dfd, pidfd;
+	DIR *directory;
+
+	if (!rxe_active)
+		return -ENOTSUP;
+	snprintf(fdpath, sizeof(fdpath), "/proc/%d/fd", pid);
+	directory = opendir(fdpath);
+	if (!directory)
+		return -errno;
+	dfd = dirfd(directory);
+	pidfd = rxe_pidfd_open(pid);
+	if (pidfd < 0) {
+		closedir(directory);
+		return -errno;
+	}
+
+	while ((de = readdir(directory)) != NULL) {
+		struct rxe_frozen_context *frozen;
+		struct stat st;
+		int target_fd;
+		int local_fd;
+		int err;
+
+		if (de->d_name[0] == '.')
+			continue;
+		target_fd = atoi(de->d_name);
+		if (target_fd <= 0 || fstatat(dfd, de->d_name, &st, 0) < 0 ||
+		    rxe_match_cdev_vma(&st, NULL, 0))
+			continue;
+		local_fd = rxe_pidfd_getfd(pidfd, target_fd);
+		if (local_fd < 0)
+			continue;
+		frozen = malloc(sizeof(*frozen));
+		if (!frozen) {
+			close(local_fd);
+			close(pidfd);
+			closedir(directory);
+			return -ENOMEM;
+		}
+		err = rxe_freeze_context(local_fd);
+		if (err) {
+			free(frozen);
+			close(local_fd);
+			close(pidfd);
+			closedir(directory);
+			return err;
+		}
+		frozen->fd = local_fd;
+		frozen->next = rxe_frozen_contexts;
+		rxe_frozen_contexts = frozen;
+	}
+	close(pidfd);
+	closedir(directory);
+	/* Continue the hook chain so another provider can freeze this task. */
+	return -ENOTSUP;
+}
+
 /*
  * RESUME_DEVICES_LATE hook (rxe). RESTORE_QP installs every restored QP
  * datapath-frozen (the kernel rxe_qp_pause on the restore path), so no
@@ -1670,6 +1786,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE,
 			rdma_rxe_plugin_resume_devices_late)
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_DEVICES_LATE,
 			rdma_rxe_plugin_dump_devices_late)
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES,
+			rdma_rxe_plugin_checkpoint_devices)
 
 /*
  * RDMA provided driver: RCD_RXE.
