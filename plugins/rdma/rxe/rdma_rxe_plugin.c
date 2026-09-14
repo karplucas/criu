@@ -646,6 +646,7 @@ static int rxe_load_image_on_restore(const char *ibdev, int control_fd)
 	}
 	if (rxe_image_get_size(&length))
 		return -1;
+	pr_info("Creating RXE load stream for %" PRIu64 " bytes\n", length);
 	load_fd = rxe_create_load_fd(control_fd, length);
 	if (load_fd < 0) {
 		pr_err("CREATE_LOAD_FD failed: %s\n", strerror(-load_fd));
