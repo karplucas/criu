@@ -407,7 +407,7 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 		cmd.attr.attr_id = RXE_IB_ATTR_SUSPEND_VHCA_SUSPEND_LOCAL;
 		cmd.attr.len = sizeof(suspend);
 		cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
-		cmd.attr.data = (uintptr_t)&suspend;
+		cmd.attr.data = suspend;
 		if (ioctl(rxe_dump_control_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 			pr_perror("Unable to resume source RXE vHCA");
 	}
@@ -1652,7 +1652,7 @@ static int rxe_suspend_vhca(int fd)
 	cmd.attr.attr_id = RXE_IB_ATTR_SUSPEND_VHCA_SUSPEND_LOCAL;
 	cmd.attr.len = sizeof(suspend);
 	cmd.attr.flags = UVERBS_ATTR_F_MANDATORY;
-	cmd.attr.data = (uintptr_t)&suspend;
+	cmd.attr.data = suspend;
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
 	return 0;
