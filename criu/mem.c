@@ -110,6 +110,14 @@ static bool should_dump_entire_vma(VmaEntry *vmae)
 		return true;
 	if (vma_entry_is(vmae, VMA_AREA_AIORING))
 		return true;
+	/*
+	 * A device plugin that claims ownership of VMA contents has already
+	 * established that the mapping can be read as memory.  Do not apply
+	 * the normal file-backed-page or soft-dirty filters: device mappings
+	 * may be backed by file pages and updated by the kernel.
+	 */
+	if (vma_entry_is(vmae, VMA_EXT_PLUGIN_CONTENT))
+		return true;
 
 	return false;
 }
