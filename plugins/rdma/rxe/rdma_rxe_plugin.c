@@ -226,6 +226,33 @@ struct rxe_cdev_cache_entry {
 };
 static struct rxe_cdev_cache_entry *rxe_cdev_cache;
 
+struct rxe_resumed_device {
+	dev_t rdev;
+	struct rxe_resumed_device *next;
+};
+static struct rxe_resumed_device *rxe_resumed_devices;
+
+static bool rxe_device_was_resumed(dev_t rdev)
+{
+	struct rxe_resumed_device *device;
+
+	for (device = rxe_resumed_devices; device; device = device->next)
+		if (device->rdev == rdev)
+			return true;
+	return false;
+}
+
+static void rxe_resumed_devices_drop_all(void)
+{
+	struct rxe_resumed_device *device, *next;
+
+	for (device = rxe_resumed_devices; device; device = next) {
+		next = device->next;
+		free(device);
+	}
+	rxe_resumed_devices = NULL;
+}
+
 static void rxe_cdev_cache_remember(const char *ibdev, uint32_t ufile_id,
 				    int fd)
 {
@@ -428,6 +455,7 @@ static void rdma_rxe_plugin_fini(int stage, int ret)
 	 */
 	if (stage == CR_PLUGIN_STAGE__RESTORE)
 		rxe_cdev_cache_drop_all();
+	rxe_resumed_devices_drop_all();
 	rxe_queue_mappings_drop_all();
 }
 
@@ -1734,12 +1762,12 @@ static int rdma_rxe_plugin_checkpoint_devices(int pid)
  * prepare_fds, so the master's rxe_cdev_cache is empty here and a
  * cache-walk thaws nothing. Instead reach the task's real ucontext fds
  * the way the dump side does -- pidfd_open(@pid) + pidfd_getfd() steals a
-		 * dup of the SAME struct file (ucontext intact), whereas a fresh cdev
-		 * open would mint a ucontext-less ib_uverbs_file that RESUME_VHCA
- * -EINVALs. Walk /proc/<pid>/fd, filter to rxe uverbs cdevs, and thaw
- * each. RESUME_DEVICES_LATE fires after the pie placed the VMAs and
- * registered the MRs but before the tasks are released, the correct
- * post-everything / pre-resume barrier.
+ * dup of the same struct file (ucontext intact), whereas a fresh cdev open
+ * would mint a ucontext-less ib_uverbs_file that RESUME_VHCA rejects. Walk
+ * /proc/<pid>/fd, filter to RXE uverbs cdevs, and thaw each device once.
+ * RESUME_DEVICES_LATE fires after the pie placed the VMAs and registered the
+ * MRs but before the tasks are released, the correct post-everything /
+ * pre-resume barrier.
  *
  * Best-effort: a thaw failure is logged (the workload stalls on that
  * ucontext) but the hook still returns 0 -- the QP is otherwise fully
@@ -1773,6 +1801,7 @@ static int rdma_rxe_plugin_resume_devices_late(int pid)
 
 	while ((de = readdir(d)) != NULL) {
 		char ibdev[64];
+		struct rxe_resumed_device *device;
 		struct stat st;
 		int target_fd, local_fd, rc;
 
@@ -1792,10 +1821,19 @@ static int rdma_rxe_plugin_resume_devices_late(int pid)
 			continue;
 		if (rxe_match_cdev_vma(&st, ibdev, sizeof(ibdev)) != 0)
 			continue;
+		if (rxe_device_was_resumed(st.st_rdev))
+			continue;
+		device = malloc(sizeof(*device));
+		if (!device) {
+			pr_err("rxe: resume_late: unable to track ibdev=%s\n", ibdev);
+			failed++;
+			continue;
+		}
 
 		local_fd = rxe_pidfd_getfd(pidfd, target_fd);
 		if (local_fd < 0) {
 			pr_perror("rxe: resume_late: pidfd_getfd(pid=%d fd=%d ibdev=%s)", pid, target_fd, ibdev);
+			free(device);
 			failed++;
 			continue;
 		}
@@ -1806,9 +1844,13 @@ static int rdma_rxe_plugin_resume_devices_late(int pid)
 			pr_err("rxe: resume_late: RESUME_VHCA pid=%d fd=%d ibdev=%s failed: %d (%s); "
 			       "restored QP datapath left frozen\n",
 			       pid, target_fd, ibdev, rc, strerror(-rc));
+			free(device);
 			failed++;
 			continue;
 		}
+		device->rdev = st.st_rdev;
+		device->next = rxe_resumed_devices;
+		rxe_resumed_devices = device;
 		pr_info("rxe: resume_late: resumed restored device (pid=%d fd=%d ibdev=%s)\n", pid, target_fd, ibdev);
 		resumed++;
 	}
