@@ -892,6 +892,12 @@ static int rxe_match_cdev_vma(const struct stat *st, char *ibdev_out,
  * declines mlx5 cdev VMAs so the mlx5 plugin's own hook can claim
  * them.
  *
+ * RXE's uverbs mmap callback exposes only vmalloc-backed queue storage.
+ * Resolving the character device to an RXE ib_device therefore verifies
+ * the mapping without depending on the separately collected uobject graph.
+ * The graph inventory remains necessary on restore to select the ucontext
+ * whose restored queue owns an offset.
+ *
  * Returns CR_PLUGIN_VMA_CONTENT on a successful claim because RXE uverbs
  * mappings are ordinary queue storage whose bytes CRIU must preserve.
  * Returns -ENOTSUP on any decline (so
@@ -917,12 +923,14 @@ static int rdma_rxe_plugin_handle_device_vma(int fd, const struct stat *st,
 	if (rc)
 		return rc;
 	mapping = rxe_queue_mapping_find(ibdev, pgoff, length);
-	if (!mapping)
-		return -ENOTSUP;
-
-	pr_info("handle_vma(%s): queue role=%u offset=%#" PRIx64
-		" length=%#" PRIx64 "\n", ibdev, mapping->role, pgoff,
-		length);
+	if (mapping)
+		pr_info("handle_vma(%s): queue role=%u offset=%#" PRIx64
+			" length=%#" PRIx64 "\n", ibdev, mapping->role,
+			pgoff, length);
+	else
+		pr_info("handle_vma(%s): RXE queue offset=%#" PRIx64
+			" length=%#" PRIx64 " is not joined to a uobject\n",
+			ibdev, pgoff, length);
 	return CR_PLUGIN_VMA_CONTENT;
 }
 
