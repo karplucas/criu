@@ -507,13 +507,18 @@ static int rdma_rxe_plugin_dump_uverbs_context(const char *ibdev,
 		return -1;
 	}
 
-	if (rxe_dump_control_fd < 0) {
-		rxe_dump_control_fd = fcntl(lfd, F_DUPFD_CLOEXEC,
-					    RXE_CACHED_FD_FLOOR);
-		if (rxe_dump_control_fd < 0) {
-			pr_perror("Unable to retain RXE dump control fd");
+	{
+		int control_fd;
+
+		control_fd = fcntl(lfd, F_DUPFD_CLOEXEC,
+				   RXE_CACHED_FD_FLOOR);
+		if (control_fd < 0) {
+			pr_perror("Unable to retain registered RXE control fd");
 			return -1;
 		}
+		if (rxe_dump_control_fd >= 0)
+			close(rxe_dump_control_fd);
+		rxe_dump_control_fd = control_fd;
 	}
 
 	return 0;
