@@ -2300,7 +2300,7 @@ int cr_dump_tasks(pid_t pid)
 	if (rdma_emit_uobj_dag())
 		goto err;
 
-	ret = run_plugins(DUMP_DEVICES_LATE, pid);
+	ret = run_plugins_all(DUMP_DEVICES_LATE, pid);
 	if (ret && ret != -ENOTSUP)
 		goto err;
 

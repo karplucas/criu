@@ -1138,7 +1138,7 @@ int checkpoint_devices(void)
 	for_each_pstree_item(iter) {
 		if (!task_alive(iter))
 			continue;
-		ret = run_plugins(CHECKPOINT_DEVICES, iter->pid->real);
+		ret = run_plugins_all(CHECKPOINT_DEVICES, iter->pid->real);
 		if (ret < 0 && ret != -ENOTSUP)
 			goto err;
 	}

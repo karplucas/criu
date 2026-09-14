@@ -44,4 +44,29 @@ typedef struct {
 		__ret;                                                                                      \
 	})
 
+/* Device lifecycle hooks are barriers shared by independent providers. */
+#define run_plugins_all(__hook, ...)                                                                        \
+	({                                                                                                  \
+		plugin_desc_t *this;                                                                        \
+		int __ret = -ENOTSUP;                                                                       \
+                                                                                                            \
+		list_for_each_entry(this, &cr_plugin_ctl.hook_chain[CR_PLUGIN_HOOK__##__hook],              \
+				    link[CR_PLUGIN_HOOK__##__hook]) {                                       \
+			int __one;                                                                           \
+                                                                                                            \
+			pr_debug("plugin: `%s' hook %u -> %p\n", this->d->name, CR_PLUGIN_HOOK__##__hook,   \
+				 this->d->hooks[CR_PLUGIN_HOOK__##__hook]);                                 \
+			__one = ((CR_PLUGIN_HOOK__##__hook##_t *)this->d->hooks[CR_PLUGIN_HOOK__##__hook])( \
+				__VA_ARGS__);                                                               \
+			if (__one == -ENOTSUP)                                                              \
+				continue;                                                                   \
+			if (__one < 0) {                                                                     \
+				__ret = __one;                                                               \
+				break;                                                                        \
+			}                                                                                   \
+			__ret = 0;                                                                          \
+		}                                                                                           \
+		__ret;                                                                                      \
+	})
+
 #endif

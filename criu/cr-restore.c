@@ -2325,7 +2325,7 @@ skip_ns_bouncing:
 	for_each_pstree_item(item) {
 		if (!task_alive(item))
 			continue;
-		ret = run_plugins(RESUME_DEVICES_LATE, item->pid->real);
+		ret = run_plugins_all(RESUME_DEVICES_LATE, item->pid->real);
 		/*
 		 * This may not really be an error. Only certain plugin hooks
 		 * (if available) will return success such as amdgpu_plugin that
