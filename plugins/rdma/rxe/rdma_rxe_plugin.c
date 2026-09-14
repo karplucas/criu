@@ -101,6 +101,8 @@ struct rxe_alloc_ucontext_req_local {
  * declines every context.
  */
 static bool rxe_active = false;
+static bool rxe_restore_image_loaded;
+static char rxe_restore_ibdev[64];
 static int rxe_dev_count = 0;
 static char rxe_ibdev_name[64];
 static int rxe_dump_control_fd = -1;
@@ -191,7 +193,7 @@ static void rxe_queue_mappings_drop_all(void)
 	rxe_queue_mappings = NULL;
 }
 
-static int rxe_load_image_on_restore(void);
+static int rxe_load_image_on_restore(const char *ibdev, int control_fd);
 static int rxe_create_save_fd(int control_fd);
 static int rxe_save_registered_contexts(void);
 
@@ -325,6 +327,8 @@ static int rdma_rxe_plugin_init(int stage)
 
 	rxe_active = false;
 	rxe_vhca_suspended = false;
+	rxe_restore_image_loaded = false;
+	rxe_restore_ibdev[0] = '\0';
 	rxe_dev_count = 0;
 	rxe_ibdev_name[0] = '\0';
 	if (rxe_dump_control_fd >= 0)
@@ -376,9 +380,6 @@ static int rdma_rxe_plugin_init(int stage)
 		pr_info("inactive (stage %d): no rxe ibdevs on this host\n",
 			stage);
 	}
-
-	if (stage == CR_PLUGIN_STAGE__RESTORE && rxe_load_image_on_restore())
-		return -1;
 
 	/*
 	 * Returning zero unconditionally so the .so stays loaded even when
@@ -561,35 +562,6 @@ static int rxe_read_sysfs(const char *path, char *buf, size_t buflen)
 	return 0;
 }
 
-static int rxe_open_cdev(const char *wanted_ibdev)
-{
-	char path[PATH_MAX];
-	char ibdev[64];
-	struct dirent *de;
-	DIR *directory;
-	int fd = -1;
-
-	directory = opendir(IB_UVERBS_CLASS_DIR);
-	if (!directory)
-		return -1;
-
-	while ((de = readdir(directory)) != NULL) {
-		if (strncmp(de->d_name, "uverbs", 6))
-			continue;
-		snprintf(path, sizeof(path), "%s/%s/ibdev",
-			 IB_UVERBS_CLASS_DIR, de->d_name);
-		if (rxe_read_sysfs(path, ibdev, sizeof(ibdev)) ||
-		    strcmp(ibdev, wanted_ibdev))
-			continue;
-		snprintf(path, sizeof(path), "/dev/infiniband/%s", de->d_name);
-		fd = open(path, O_RDWR | O_CLOEXEC);
-		break;
-	}
-
-	closedir(directory);
-	return fd;
-}
-
 static int rxe_create_save_fd(int control_fd)
 {
 	struct {
@@ -655,37 +627,24 @@ static int rxe_load_vhca(int control_fd, int load_fd)
 	return 0;
 }
 
-static int rxe_load_image_on_restore(void)
+static int rxe_load_image_on_restore(const char *ibdev, int control_fd)
 {
 	uint64_t length;
-	int control_fd;
 	int load_fd;
 	int ret = -1;
 
+	if (rxe_restore_image_loaded)
+		return strcmp(ibdev, rxe_restore_ibdev) ? -EXDEV : 0;
 	if (faccessat(criu_get_image_dir(), RXE_MIG_IMAGE_NAME, F_OK, 0)) {
-		if (errno == ENOENT)
-			return 0;
 		pr_perror("Unable to inspect %s", RXE_MIG_IMAGE_NAME);
-		return -1;
-	}
-	if (rxe_dev_count != 1) {
-		pr_err("%s requires exactly one destination RXE device; found %d\n",
-		       RXE_MIG_IMAGE_NAME, rxe_dev_count);
 		return -1;
 	}
 	if (rxe_image_get_size(&length))
 		return -1;
-
-	control_fd = rxe_open_cdev(rxe_ibdev_name);
-	if (control_fd < 0) {
-		pr_perror("Unable to open RXE control cdev for %s",
-			  rxe_ibdev_name);
-		return -1;
-	}
 	load_fd = rxe_create_load_fd(control_fd, length);
 	if (load_fd < 0) {
 		pr_err("CREATE_LOAD_FD failed: %s\n", strerror(-load_fd));
-		goto out_control;
+		return -1;
 	}
 	if (rxe_image_load(load_fd, length))
 		goto out_load;
@@ -695,11 +654,13 @@ static int rxe_load_image_on_restore(void)
 		ret = -1;
 		goto out_load;
 	}
+	rxe_restore_image_loaded = true;
+	snprintf(rxe_restore_ibdev, sizeof(rxe_restore_ibdev), "%s", ibdev);
+	pr_info("Loaded %s (%" PRIu64 " bytes) on %s\n",
+		RXE_MIG_IMAGE_NAME, length, ibdev);
 	ret = 0;
 out_load:
 	close(load_fd);
-out_control:
-	close(control_fd);
 	return ret;
 }
 
@@ -815,10 +776,17 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		       uvfe->ib_dev, IB_UVERBS_CLASS_DIR, uvfe->ib_dev);
 		return -1;
 	}
+	if (rxe_load_image_on_restore(uvfe->ib_dev, fd)) {
+		pr_err("open_uverbs_cdev: unable to load %s on %s\n",
+		       RXE_MIG_IMAGE_NAME, uvfe->ib_dev);
+		close(fd);
+		return -1;
+	}
 
 	rc = rxe_send_get_context_restore(fd, uvfe->id);
 	if (rc) {
-		pr_err("open_uverbs_cdev: GET_CONTEXT(restore mode) on fd=%d for ibdev=%s failed: %d (%s)\n", fd,
+		pr_err("open_uverbs_cdev: GET_CONTEXT(ufile_id=%#x) on fd=%d "
+		       "for ibdev=%s failed: %d (%s)\n", uvfe->id, fd,
 		       uvfe->ib_dev, rc, strerror(-rc));
 		close(fd);
 		return -1;
