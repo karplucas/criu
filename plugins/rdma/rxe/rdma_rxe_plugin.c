@@ -787,6 +787,9 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		pr_err("open_uverbs_cdev: GET_CONTEXT(ufile_id=%#x) on fd=%d "
 		       "for ibdev=%s failed: %d (%s)\n", uvfe->id, fd,
 		       uvfe->ib_dev, rc, strerror(-rc));
+		if (rc == -ENOENT)
+			pr_err("RXE kernel attempted to bind the bootstrap context "
+			       "before LOAD_VHCA; update the loaded rdma_rxe module\n");
 		close(fd);
 		return -1;
 	}
