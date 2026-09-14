@@ -1660,11 +1660,42 @@ static int rxe_suspend_vhca(int fd)
 
 static int rdma_rxe_plugin_checkpoint_devices(int pid)
 {
+	char fdpath[64];
+	struct dirent *de;
+	DIR *directory;
+	int dfd, pidfd;
+
 	if (!rxe_active)
 		return -ENOTSUP;
-	(void)pid;
 	if (rxe_vhca_suspended)
 		return -ENOTSUP;
+
+	snprintf(fdpath, sizeof(fdpath), "/proc/%d/fd", pid);
+	directory = opendir(fdpath);
+	if (!directory)
+		return -errno;
+	dfd = dirfd(directory);
+	pidfd = rxe_pidfd_open(pid);
+	if (pidfd < 0) {
+		closedir(directory);
+		return -errno;
+	}
+	while ((de = readdir(directory)) != NULL) {
+		struct stat st;
+		int target_fd;
+
+		if (de->d_name[0] == '.')
+			continue;
+		target_fd = atoi(de->d_name);
+		if (target_fd <= 0 || fstatat(dfd, de->d_name, &st, 0) < 0 ||
+		    rxe_match_cdev_vma(&st, NULL, 0))
+			continue;
+		rxe_dump_control_fd = rxe_pidfd_getfd(pidfd, target_fd);
+		if (rxe_dump_control_fd >= 0)
+			break;
+	}
+	close(pidfd);
+	closedir(directory);
 	if (rxe_dump_control_fd < 0)
 		return -ENOTSUP;
 	if (rxe_suspend_vhca(rxe_dump_control_fd))
