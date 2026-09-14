@@ -781,18 +781,17 @@ static int rdma_rxe_plugin_open_uverbs_cdev(const UverbsFileEntry *uvfe)
 		       uvfe->ib_dev, IB_UVERBS_CLASS_DIR, uvfe->ib_dev);
 		return -1;
 	}
-	if (rxe_load_image_on_restore(uvfe->ib_dev, fd)) {
-		pr_err("open_uverbs_cdev: unable to load %s on %s\n",
-		       RXE_MIG_IMAGE_NAME, uvfe->ib_dev);
-		close(fd);
-		return -1;
-	}
-
 	rc = rxe_send_get_context_restore(fd, uvfe->id);
 	if (rc) {
 		pr_err("open_uverbs_cdev: GET_CONTEXT(ufile_id=%#x) on fd=%d "
 		       "for ibdev=%s failed: %d (%s)\n", uvfe->id, fd,
 		       uvfe->ib_dev, rc, strerror(-rc));
+		close(fd);
+		return -1;
+	}
+	if (rxe_load_image_on_restore(uvfe->ib_dev, fd)) {
+		pr_err("open_uverbs_cdev: unable to load %s on %s\n",
+		       RXE_MIG_IMAGE_NAME, uvfe->ib_dev);
 		close(fd);
 		return -1;
 	}
